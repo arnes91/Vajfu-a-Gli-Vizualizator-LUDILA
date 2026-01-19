@@ -297,8 +297,7 @@ const Visualizer: React.FC = () => {
 
       // 2. Call Gemini
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const model = ai.getGenerativeModel({ model: "gemini-2.5-flash-preview" });
-
+      
       const prompt = `
         Listen to this audio file. It contains music with lyrics which may be in Bosnian, English, or Japanese.
         Transcribe the lyrics and provide precise timestamps for each line.
@@ -312,17 +311,27 @@ const Visualizer: React.FC = () => {
         If instrumental, return an empty array.
       `;
 
-      const result = await model.generateContent([
-        prompt,
-        {
-          inlineData: {
-            mimeType: audioFile.type || "audio/mp3",
-            data: base64Audio
-          }
+      const result = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: {
+            parts: [
+                { text: prompt },
+                {
+                    inlineData: {
+                        mimeType: audioFile.type || "audio/mp3",
+                        data: base64Audio
+                    }
+                }
+            ]
         }
-      ]);
+      });
 
-      const responseText = result.response.text();
+      const responseText = result.text;
+      
+      if (!responseText) {
+          throw new Error("Empty response from AI");
+      }
+
       // Clean up markdown if Gemini adds it despite instructions
       const jsonStr = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
       
