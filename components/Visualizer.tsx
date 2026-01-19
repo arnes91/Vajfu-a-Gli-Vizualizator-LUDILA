@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { GoogleGenAI } from "@google/genai";
 
 // --- Constants ---
 const THEME = {
@@ -7,6 +8,7 @@ const THEME = {
   background: '#050505',
   wave: '#00ffcc',      // Oscilloscope Cyan
   matrix: '#00ff41',    // Matrix Green
+  textGlow: '#ffffff',
 };
 
 // --- Shader Source (The "Brzi Arzi" / Cyberpunk Core) ---
@@ -22,6 +24,9 @@ const FRAGMENT_SHADER = `
   uniform float uBass;
   uniform float uMid;
   uniform float uHigh;
+
+  // Noise function
+  float hash(vec2 p) { return fract(1e4 * sin(17.0 * p.x + p.y * 0.1) * (0.1 + abs(sin(p.y * 13.0 + p.x)))); }
 
   void main() {
     vec2 uv = gl_FragCoord.xy / uResolution.xy;
@@ -51,6 +56,12 @@ const FRAGMENT_SHADER = `
     float block = step(0.9, fract(uv.x * 10.0 + uTime)) * step(0.9, fract(uv.y * 10.0 - uTime));
     col += vec3(1.0) * block * uHigh * 0.5;
 
+    // 4. CRT Scanline & Grain
+    float scanline = sin(uv.y * 800.0) * 0.04;
+    col -= scanline;
+    float noise = hash(uv + uTime) * 0.1;
+    col += noise;
+
     // Vignette
     col *= 1.0 - 0.5 * radius;
 
@@ -70,6 +81,16 @@ interface Particle {
   color: string;
 }
 
+interface LyricLine {
+  time: number;
+  text: string;
+}
+
+interface ExportConfig {
+  resolution: '1080p' | '4K';
+  aspectRatio: '16:9' | '9:16';
+}
+
 const Visualizer: React.FC = () => {
   // --- Refs ---
   const canvasRef = useRef<HTMLCanvasElement>(null);      // 2D Composition Layer
@@ -83,6 +104,7 @@ const Visualizer: React.FC = () => {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const animationFrameRef = useRef<number>(0);
+  const audioStartTimeRef = useRef<number>(0);
 
   // WebGL
   const glRef = useRef<WebGLRenderingContext | null>(null);
@@ -91,7 +113,9 @@ const Visualizer: React.FC = () => {
 
   // Visual State Refs
   const particlesRef = useRef<Particle[]>([]);
-  const matrixDropsRef = useRef<number[]>([]); // Matrix Rain positions
+  const matrixDropsRef = useRef<number[]>([]); 
+  const currentLyricIndexRef = useRef<number>(-1);
+  const lyricDecodedCharsRef = useRef<number>(0); // For Matrix decoding effect on lyrics
 
   // Recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -101,7 +125,10 @@ const Visualizer: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [status, setStatus] = useState<string>("SYSTEM READY");
+  const [lyrics, setLyrics] = useState<LyricLine[]>([]);
+  const [exportConfig, setExportConfig] = useState<ExportConfig>({ resolution: '1080p', aspectRatio: '16:9' });
 
   // --- Helpers ---
   const createShader = (gl: WebGLRenderingContext, type: number, source: string) => {
@@ -177,43 +204,178 @@ const Visualizer: React.FC = () => {
     audioContextRef.current = null;
     analyserRef.current = null;
     sourceRef.current = null;
+    currentLyricIndexRef.current = -1;
   };
 
-  // --- Resize ---
+  // --- Resize / Config Resolution ---
+  const getDimensions = useCallback(() => {
+    if (isPlaying || isExporting) {
+       // Force resolution based on config
+       let w = 1920;
+       let h = 1080;
+       
+       if (exportConfig.resolution === '4K') {
+         w = 3840;
+         h = 2160;
+       }
+
+       if (exportConfig.aspectRatio === '9:16') {
+         // Swap for vertical
+         const temp = w;
+         w = h;
+         h = temp;
+       }
+       return { w, h };
+    }
+    // Default preview mode
+    if (containerRef.current) {
+       return { 
+         w: containerRef.current.clientWidth,
+         h: containerRef.current.clientHeight
+       };
+    }
+    return { w: 1920, h: 1080 };
+  }, [isPlaying, isExporting, exportConfig]);
+
   const handleResize = useCallback(() => {
-    if (containerRef.current && canvasRef.current && glCanvasRef.current) {
-      const w = containerRef.current.clientWidth;
-      const h = containerRef.current.clientHeight;
-      
+    const { w, h } = getDimensions();
+    
+    if (canvasRef.current) {
       canvasRef.current.width = w;
       canvasRef.current.height = h;
-      
+    }
+    if (glCanvasRef.current) {
       glCanvasRef.current.width = w;
       glCanvasRef.current.height = h;
-
-      if (glRef.current) glRef.current.viewport(0, 0, w, h);
-
-      // Setup Matrix Canvas
-      if (!matrixCanvasRef.current) {
-        matrixCanvasRef.current = document.createElement('canvas');
-      }
-      matrixCanvasRef.current.width = w;
-      matrixCanvasRef.current.height = h;
-
-      // Reset Matrix Drops
-      const fontSize = 16;
-      const columns = Math.ceil(w / fontSize);
-      // Initialize drops at random Y positions
-      matrixDropsRef.current = new Array(columns).fill(0).map(() => Math.random() * -100);
     }
-  }, []);
+
+    if (glRef.current) glRef.current.viewport(0, 0, w, h);
+
+    // Setup Matrix Canvas
+    if (!matrixCanvasRef.current) {
+      matrixCanvasRef.current = document.createElement('canvas');
+    }
+    matrixCanvasRef.current.width = w;
+    matrixCanvasRef.current.height = h;
+
+    const fontSize = exportConfig.resolution === '4K' ? 32 : 16;
+    const columns = Math.ceil(w / fontSize);
+    matrixDropsRef.current = new Array(columns).fill(0).map(() => Math.random() * -100);
+
+  }, [getDimensions, exportConfig]);
 
   useEffect(() => {
-    window.addEventListener('resize', handleResize);
-    handleResize();
-    initWebGL();
-    return () => window.removeEventListener('resize', handleResize);
-  }, [handleResize, initWebGL]);
+    // Only bind window resize if NOT exporting/playing specific resolution
+    if (!isPlaying) {
+      window.addEventListener('resize', handleResize);
+      handleResize();
+      initWebGL();
+      return () => window.removeEventListener('resize', handleResize);
+    } else {
+      handleResize(); // Set fixed size once
+      initWebGL();
+    }
+  }, [handleResize, initWebGL, isPlaying]);
+
+  // --- AI LYRICS GENERATION ---
+  const generateLyrics = async (audioFile: File) => {
+    if (!process.env.API_KEY) {
+      console.warn("No API KEY found");
+      return;
+    }
+
+    setIsAnalyzing(true);
+    setStatus("AI_CORE_ANALYZING_LYRICS...");
+
+    try {
+      // 1. Convert File to Base64
+      const arrayBuffer = await audioFile.arrayBuffer();
+      const base64Audio = btoa(
+        new Uint8Array(arrayBuffer)
+          .reduce((data, byte) => data + String.fromCharCode(byte), '')
+      );
+
+      // 2. Call Gemini
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const model = ai.getGenerativeModel({ model: "gemini-2.5-flash-preview" });
+
+      const prompt = `
+        Listen to this audio file. It contains music with lyrics which may be in Bosnian, English, or Japanese.
+        Transcribe the lyrics and provide precise timestamps for each line.
+        
+        Return STRICTLY a JSON array of objects. Do not wrap in markdown code blocks.
+        Format:
+        [
+          { "time": 0.5, "text": "First line of lyrics" },
+          { "time": 3.2, "text": "Second line..." }
+        ]
+        If instrumental, return an empty array.
+      `;
+
+      const result = await model.generateContent([
+        prompt,
+        {
+          inlineData: {
+            mimeType: audioFile.type || "audio/mp3",
+            data: base64Audio
+          }
+        }
+      ]);
+
+      const responseText = result.response.text();
+      // Clean up markdown if Gemini adds it despite instructions
+      const jsonStr = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+      
+      const parsedLyrics = JSON.parse(jsonStr);
+      setLyrics(parsedLyrics);
+      setStatus("LYRICS_ACQUIRED");
+
+    } catch (e) {
+      console.error("AI Error:", e);
+      setStatus("AI_ANALYSIS_FAILED_PROCEEDING_WITHOUT_LYRICS");
+      setLyrics([]);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  // --- LYRICS RENDERER ---
+  const renderTextEffect = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, bass: number, w: number) => {
+    // Determine font size based on resolution
+    const baseSize = exportConfig.resolution === '4K' ? 120 : 60;
+    const fontSize = baseSize + (bass * 20);
+    
+    ctx.font = `900 ${fontSize}px "Courier New", monospace`; // Fallback to monospace for consistency
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // 1. Chromatic Aberration (RGB Split)
+    const offset = bass * 15;
+    
+    // Red Channel
+    ctx.globalCompositeOperation = 'screen';
+    ctx.fillStyle = 'rgba(255, 0, 0, 0.8)';
+    ctx.fillText(text, x - offset, y + offset);
+
+    // Blue Channel
+    ctx.fillStyle = 'rgba(0, 255, 255, 0.8)';
+    ctx.fillText(text, x + offset, y - offset);
+
+    // Main Text (White/Teal)
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowBlur = 20 * bass;
+    ctx.shadowColor = THEME.secondary;
+    ctx.fillText(text, x, y);
+    ctx.shadowBlur = 0;
+
+    // Japanese/Kanji specific glow if detected
+    if (/[一-龯]/.test(text)) {
+         ctx.strokeStyle = THEME.secondary;
+         ctx.lineWidth = 2;
+         ctx.strokeText(text, x, y);
+    }
+  };
 
   // --- CORE RENDER LOOP ---
   const renderFrame = useCallback(() => {
@@ -221,8 +383,9 @@ const Visualizer: React.FC = () => {
     const glCanvas = glCanvasRef.current;
     const gl = glRef.current;
     const analyser = analyserRef.current;
+    const ac = audioContextRef.current;
 
-    if (!canvas || !glCanvas || !gl || !analyser) return;
+    if (!canvas || !glCanvas || !gl || !analyser || !ac) return;
 
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
@@ -262,26 +425,24 @@ const Visualizer: React.FC = () => {
     // 3. Composite WebGL -> 2D Canvas
     ctx.drawImage(glCanvas, 0, 0);
 
-    // 4. MATRIX RAIN EFFECT (Foreground, Persistent Trails)
+    // 4. MATRIX RAIN EFFECT
     const matrixCanvas = matrixCanvasRef.current;
     if (matrixCanvas) {
         const mCtx = matrixCanvas.getContext('2d');
         if (mCtx) {
-            // Fade existing trails by reducing alpha (destination-out)
-            // This allows the WebGL background to show through the trails
             mCtx.fillStyle = 'rgba(0, 0, 0, 0.05)';
             mCtx.globalCompositeOperation = 'destination-out';
             mCtx.fillRect(0, 0, w, h);
             mCtx.globalCompositeOperation = 'source-over';
 
-            const fontSize = 16;
+            const fontSize = exportConfig.resolution === '4K' ? 32 : 16;
             mCtx.font = `${fontSize}px monospace`;
             
             const drops = matrixDropsRef.current;
             for (let i = 0; i < drops.length; i++) {
+                // Include Katakana for Miku vibes
                 const char = String.fromCharCode(0x30A0 + Math.random() * 96);
                 
-                // Bright flash on bass, else standard matrix green
                 if (isBassHit) {
                     mCtx.fillStyle = Math.random() > 0.5 ? '#ffffff' : THEME.wave;
                 } else {
@@ -292,15 +453,11 @@ const Visualizer: React.FC = () => {
                 const y = drops[i] * fontSize;
                 mCtx.fillText(char, x, y);
 
-                // Reset drop
                 if (y > h && Math.random() > 0.975) {
                     drops[i] = 0;
                 }
-                // Speed increment
                 drops[i] += (isBassHit ? 1.0 : 0.5) + (Math.random() * 0.2);
             }
-            
-            // Draw the matrix layer on top of the WebGL background
             ctx.drawImage(matrixCanvas, 0, 0);
         }
     }
@@ -309,7 +466,7 @@ const Visualizer: React.FC = () => {
     const timeDomain = new Uint8Array(bufferLength);
     analyser.getByteTimeDomainData(timeDomain);
 
-    ctx.lineWidth = 3;
+    ctx.lineWidth = exportConfig.resolution === '4K' ? 6 : 3;
     ctx.strokeStyle = THEME.wave;
     ctx.shadowBlur = 15;
     ctx.shadowColor = THEME.wave;
@@ -322,7 +479,6 @@ const Visualizer: React.FC = () => {
         const v = timeDomain[i] / 128.0;
         const y = v * (h / 2);
 
-        // Glitch Shake
         let gx = wx;
         let gy = y;
         if(bass > 0.8) {
@@ -336,19 +492,19 @@ const Visualizer: React.FC = () => {
         wx += sliceW;
     }
     ctx.stroke();
-    ctx.shadowBlur = 0; // Reset
+    ctx.shadowBlur = 0; 
 
-    // 6. Update & Draw Particles (Debris)
+    // 6. Particles
     if (isBassHit) {
         const count = Math.floor(bass * 5);
         for(let k=0; k<count; k++) {
             particlesRef.current.push({
                 x: Math.random() * w,
                 y: Math.random() * h,
-                w: Math.random() * 5 + 2,
-                h: Math.random() * 20 + 2,
-                vx: (Math.random() - 0.5) * 20,
-                vy: (Math.random() - 0.5) * 20,
+                w: Math.random() * (w * 0.005) + 2,
+                h: Math.random() * (h * 0.02) + 2,
+                vx: (Math.random() - 0.5) * (w * 0.02),
+                vy: (Math.random() - 0.5) * (h * 0.02),
                 life: 1.0,
                 color: Math.random() > 0.5 ? THEME.primary : THEME.secondary
             });
@@ -371,9 +527,9 @@ const Visualizer: React.FC = () => {
         }
     }
 
-    // 7. Draw Spectrum with "Web" Effect
-    const radius = Math.min(w, h) * 0.2 + (bass * 50);
-    ctx.lineWidth = 2;
+    // 7. Spectrum Web
+    const radius = Math.min(w, h) * 0.2 + (bass * (Math.min(w,h) * 0.1));
+    ctx.lineWidth = exportConfig.resolution === '4K' ? 4 : 2;
     ctx.strokeStyle = THEME.primary;
     ctx.beginPath();
     
@@ -383,7 +539,7 @@ const Visualizer: React.FC = () => {
     for(let i=0; i<sliceCount; i++) {
         const freqIdx = Math.floor((i / sliceCount) * (bufferLength / 2));
         const val = dataArray[freqIdx] / 255;
-        const barH = val * 100 * (1 + bass);
+        const barH = val * (Math.min(w,h) * 0.3) * (1 + bass);
 
         const angle = i * step + (isBassHit ? (Math.random()-0.5)*0.1 : 0);
         
@@ -394,61 +550,81 @@ const Visualizer: React.FC = () => {
 
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
-
-        if (bass > 0.8 && val > 0.6 && i % 8 === 0) {
-            ctx.moveTo(x2, y2);
-            ctx.lineTo(cx, cy);
-        }
     }
     ctx.stroke();
 
-    // 8. Glitch Text
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    let labelFontSize = Math.min(w, h) * 0.08;
+    // 8. LYRICS DISPLAY (AI INTEGRATED)
+    // Calculate current song time
+    const currentTime = ac.currentTime - audioStartTimeRef.current;
     
-    if (isBassHit) {
-        const skew = (Math.random() - 0.5);
-        const shakeX = (Math.random() - 0.5) * 20;
-        const shakeY = (Math.random() - 0.5) * 20;
-        ctx.translate(cx + shakeX, cy + shakeY);
-        ctx.transform(1, skew, 0, 1, 0, 0);
+    // Find current lyric
+    const lyricIdx = lyrics.findIndex((l, i) => {
+        const next = lyrics[i+1];
+        return currentTime >= l.time && (!next || currentTime < next.time);
+    });
+
+    if (lyricIdx !== -1) {
+        const lyric = lyrics[lyricIdx];
         
-        ctx.font = `900 ${labelFontSize}px monospace`;
-        ctx.fillStyle = '#ff0000';
-        ctx.fillText("MIKU", -5, -40);
-        ctx.fillStyle = '#00ffff';
-        ctx.fillText("MIKU", 5, -40);
+        // Reset decoding if changed
+        if (currentLyricIndexRef.current !== lyricIdx) {
+            currentLyricIndexRef.current = lyricIdx;
+            lyricDecodedCharsRef.current = 0;
+        }
+
+        // Increment decoded chars logic (Matrix reveal)
+        if (lyricDecodedCharsRef.current < lyric.text.length) {
+            lyricDecodedCharsRef.current += 0.5; // Speed of reveal
+        }
+
+        const visibleChars = Math.floor(lyricDecodedCharsRef.current);
+        let displayText = lyric.text.substring(0, visibleChars);
         
-        ctx.fillStyle = '#ff00ff';
-        ctx.fillText("VAJFUŠA", 0, 40);
-    } else {
-        ctx.translate(cx, cy);
-        ctx.font = `900 ${labelFontSize}px monospace`;
-        ctx.fillStyle = THEME.primary;
-        ctx.shadowBlur = 10;
-        ctx.shadowColor = THEME.primary;
-        ctx.fillText("MIKU", 0, -40);
-        ctx.fillStyle = '#fff';
-        ctx.fillText("VAJFUŠA", 0, 40);
+        // Add random glitch chars at the end of the reveal
+        if (visibleChars < lyric.text.length) {
+             displayText += String.fromCharCode(0x30A0 + Math.random() * 50);
+        }
+
+        // Apply Heavy Shake on Bass
+        let tx = cx;
+        let ty = h * 0.85; // Position at bottom
+        
+        if (bass > 0.6) {
+             tx += (Math.random() - 0.5) * 20;
+             ty += (Math.random() - 0.5) * 20;
+        }
+
+        renderTextEffect(ctx, displayText, tx, ty, bass, w);
     }
+
+    // 9. Status / Glitch Overlay Text
+    ctx.save();
+    ctx.textAlign = 'left';
+    ctx.font = `bold ${w * 0.015}px monospace`;
+    ctx.fillStyle = THEME.textGlow;
+    ctx.fillText(`AUDIO: ${bass > 0.8 ? 'CRITICAL' : 'STABLE'}`, 40, h - 40);
+    ctx.fillText(`LYRICS: ${lyrics.length > 0 ? 'AI_LINKED' : 'OFFLINE'}`, 40, h - 70);
     ctx.restore();
 
-    // 9. Scanlines
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-    for (let y = 0; y < h; y += 4) {
-        ctx.fillRect(0, y, w, 1);
-    }
-
     animationFrameRef.current = requestAnimationFrame(renderFrame);
-  }, []);
+  }, [exportConfig, lyrics]);
 
   // --- Audio Init ---
   const initializeAudio = async (mode: 'PLAY' | 'EXPORT') => {
     if (!file) return;
+    
+    // AI check
+    if (lyrics.length === 0 && !isAnalyzing) {
+        const confirmNoLyrics = window.confirm("AI Lyrics not generated yet. Do you want to generate them now? (Cancel to proceed without)");
+        if (confirmNoLyrics) {
+            await generateLyrics(file);
+        }
+    }
+
     stopVisualization();
-    initWebGL();
+    
+    // Resize for Export needs to happen BEFORE context creation to ensure buffer size
+    handleResize();
 
     const CtxClass = window.AudioContext || (window as any).webkitAudioContext;
     const actx = new CtxClass();
@@ -474,29 +650,36 @@ const Visualizer: React.FC = () => {
             source.connect(dest);
 
             if (canvasRef.current) {
+                // Ensure the stream captures the high-res canvas
                 const stream = canvasRef.current.captureStream(60);
                 const track = dest.stream.getAudioTracks()[0];
                 stream.addTrack(track);
 
-                const types = ['video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
-                const mime = types.find(t => MediaRecorder.isTypeSupported(t)) || '';
+                // High bitrate for 4K
+                const options = {
+                    mimeType: 'video/webm;codecs=vp9',
+                    videoBitsPerSecond: exportConfig.resolution === '4K' ? 25000000 : 8000000 
+                };
+                
+                if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                     options.mimeType = 'video/mp4'; // Fallback
+                }
 
-                if (!mime) { alert("No rec support"); return; }
-
-                const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8000000 });
+                const rec = new MediaRecorder(stream, options);
                 mediaRecorderRef.current = rec;
                 recordedChunksRef.current = [];
                 
                 rec.ondataavailable = e => { if(e.data.size>0) recordedChunksRef.current.push(e.data); };
                 rec.onstop = () => {
-                    const blob = new Blob(recordedChunksRef.current, {type: mime});
+                    const blob = new Blob(recordedChunksRef.current, {type: options.mimeType});
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `glitch_core_${Date.now()}.${mime.includes('mp4')?'mp4':'webm'}`;
+                    a.download = `glitch_core_${exportConfig.resolution}_${Date.now()}.webm`;
                     a.click();
                     setIsExporting(false);
                     setStatus("EXPORT_DONE");
+                    setIsPlaying(false);
                 };
                 rec.start();
                 setStatus("RECORDING...");
@@ -505,6 +688,7 @@ const Visualizer: React.FC = () => {
             setStatus("VISUAL_CORE_ONLINE");
         }
 
+        audioStartTimeRef.current = actx.currentTime;
         source.start(0);
         
         audioContextRef.current = actx;
@@ -527,59 +711,116 @@ const Visualizer: React.FC = () => {
 
   // --- Handlers ---
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) setFile(e.target.files[0]);
+    if (e.target.files?.[0]) {
+        setFile(e.target.files[0]);
+        setLyrics([]); // Reset lyrics for new file
+    }
   };
 
   return (
-    <div ref={containerRef} className="relative w-full h-full bg-black overflow-hidden select-none font-mono text-white">
+    <div ref={containerRef} className="relative w-full h-full bg-black overflow-hidden select-none font-mono text-white flex items-center justify-center">
       {/* Hidden WebGL Layer */}
-      <canvas ref={glCanvasRef} className="absolute inset-0 w-full h-full invisible pointer-events-none" />
+      <canvas ref={glCanvasRef} className="absolute top-0 left-0 w-full h-full invisible pointer-events-none" />
       
-      {/* Visible Composition Layer */}
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block" />
+      {/* Visible Composition Layer - Scaled down via CSS if larger than screen, but intrinsic size remains high */}
+      <canvas 
+        ref={canvasRef} 
+        className="block max-w-full max-h-full object-contain shadow-[0_0_50px_rgba(0,255,204,0.1)]"
+        style={{
+             aspectRatio: exportConfig.aspectRatio === '16:9' ? '16/9' : '9/16'
+        }}
+      />
 
       {/* UI Overlay */}
       <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center z-10">
-         <div className="absolute top-4 left-4 text-[#39c5bb] text-xs border-l-2 border-[#39c5bb] pl-2">
+         <div className="absolute top-4 left-4 text-[#39c5bb] text-xs border-l-2 border-[#39c5bb] pl-2 bg-black/50 p-2">
             <p>STATUS: {status}</p>
-            <p>ENGINE: HYBRID V10 (MATRIX+GL)</p>
+            <p>RES: {exportConfig.resolution} // {exportConfig.aspectRatio}</p>
+            <p>AI LYRICS: {lyrics.length > 0 ? "LOADED" : "NULL"}</p>
          </div>
 
          {!isPlaying && (
-            <div className="pointer-events-auto bg-black/90 border border-[#39c5bb] p-10 text-center shadow-[0_0_50px_rgba(57,197,187,0.2)]">
-                <h1 className="text-5xl font-bold mb-2 tracking-tighter text-white" style={{textShadow: '3px 3px #ff00ff'}}>
+            <div className="pointer-events-auto bg-black/90 border border-[#39c5bb] p-8 text-center shadow-[0_0_50px_rgba(57,197,187,0.2)] max-w-2xl w-full backdrop-blur-md">
+                <h1 className="text-5xl font-bold mb-2 tracking-tighter text-white glitch-text" style={{textShadow: '3px 3px #ff00ff'}}>
                     MIKU PROTOCOL
                 </h1>
-                <p className="text-[#39c5bb] tracking-[0.5em] text-sm mb-8">V.10.0 FINAL</p>
+                <p className="text-[#39c5bb] tracking-[0.5em] text-sm mb-6">V.11.0 AI INTEGRATED</p>
                 
                 <input type="file" ref={fileInputRef} onChange={handleFile} accept="audio/*" className="hidden" />
                 
                 {!file ? (
-                    <button onClick={() => fileInputRef.current?.click()} className="border border-[#39c5bb] px-8 py-3 hover:bg-[#39c5bb] hover:text-black transition-colors font-bold tracking-widest text-[#39c5bb]">
+                    <button onClick={() => fileInputRef.current?.click()} className="w-full border border-[#39c5bb] px-8 py-4 hover:bg-[#39c5bb] hover:text-black transition-colors font-bold tracking-widest text-[#39c5bb] mb-4">
                         INITIALIZE FILE
                     </button>
                 ) : (
-                    <div className="flex gap-4 justify-center">
-                        <button onClick={() => initializeAudio('PLAY')} className="bg-[#39c5bb] text-black px-6 py-3 font-bold tracking-widest hover:scale-105 transition-transform">
-                            ENGAGE
-                        </button>
-                        <button onClick={() => initializeAudio('EXPORT')} className="border border-[#ff00ff] text-[#ff00ff] px-6 py-3 font-bold tracking-widest hover:bg-[#ff00ff] hover:text-white transition-colors">
-                            RENDER MP4
-                        </button>
+                    <div className="flex flex-col gap-4">
+                        <div className="grid grid-cols-2 gap-4 mb-4 text-xs">
+                             <div className="border border-gray-700 p-2 text-left">
+                                 <p className="text-gray-500 mb-1">ASPECT RATIO</p>
+                                 <div className="flex gap-2">
+                                     <button 
+                                        onClick={() => setExportConfig(p => ({...p, aspectRatio: '16:9'}))}
+                                        className={`px-2 py-1 ${exportConfig.aspectRatio === '16:9' ? 'bg-[#39c5bb] text-black' : 'text-gray-400'}`}>
+                                        16:9 (WIDE)
+                                     </button>
+                                     <button 
+                                        onClick={() => setExportConfig(p => ({...p, aspectRatio: '9:16'}))}
+                                        className={`px-2 py-1 ${exportConfig.aspectRatio === '9:16' ? 'bg-[#39c5bb] text-black' : 'text-gray-400'}`}>
+                                        9:16 (MOBILE)
+                                     </button>
+                                 </div>
+                             </div>
+                             <div className="border border-gray-700 p-2 text-left">
+                                 <p className="text-gray-500 mb-1">RESOLUTION</p>
+                                 <div className="flex gap-2">
+                                     <button 
+                                        onClick={() => setExportConfig(p => ({...p, resolution: '1080p'}))}
+                                        className={`px-2 py-1 ${exportConfig.resolution === '1080p' ? 'bg-[#39c5bb] text-black' : 'text-gray-400'}`}>
+                                        1080p
+                                     </button>
+                                     <button 
+                                        onClick={() => setExportConfig(p => ({...p, resolution: '4K'}))}
+                                        className={`px-2 py-1 ${exportConfig.resolution === '4K' ? 'bg-[#39c5bb] text-black' : 'text-gray-400'}`}>
+                                        4K (UHD)
+                                     </button>
+                                 </div>
+                             </div>
+                        </div>
+
+                        {lyrics.length === 0 && (
+                            <button 
+                                onClick={() => file && generateLyrics(file)} 
+                                disabled={isAnalyzing}
+                                className="border border-dashed border-[#ff00ff] text-[#ff00ff] px-6 py-3 font-bold tracking-widest hover:bg-[#ff00ff]/10 transition-colors disabled:opacity-50">
+                                {isAnalyzing ? "ANALYZING NEURAL DATA..." : "GENERATE AI LYRICS"}
+                            </button>
+                        )}
+
+                        <div className="flex gap-4 mt-4">
+                            <button onClick={() => initializeAudio('PLAY')} className="flex-1 bg-[#39c5bb] text-black px-6 py-4 font-bold tracking-widest hover:scale-105 transition-transform text-lg">
+                                ENGAGE
+                            </button>
+                            <button onClick={() => initializeAudio('EXPORT')} className="flex-1 border border-[#ff00ff] text-[#ff00ff] px-6 py-4 font-bold tracking-widest hover:bg-[#ff00ff] hover:text-white transition-colors">
+                                RENDER VIDEO
+                            </button>
+                        </div>
                     </div>
                 )}
             </div>
          )}
          
          {isExporting && (
-             <div className="absolute top-4 right-4 flex items-center gap-2">
-                 <div className="w-3 h-3 bg-red-600 rounded-full animate-pulse" />
-                 <span className="text-red-500 font-bold tracking-widest text-xs">REC</span>
+             <div className="absolute top-4 right-4 flex flex-col items-end gap-1">
+                 <div className="flex items-center gap-2">
+                    <div className="w-4 h-4 bg-red-600 rounded-full animate-pulse shadow-[0_0_20px_red]" />
+                    <span className="text-red-500 font-bold tracking-widest text-lg">REC // {exportConfig.resolution}</span>
+                 </div>
+                 <span className="text-xs text-gray-400">DO NOT CLOSE TAB</span>
              </div>
          )}
          
          {isPlaying && !isExporting && (
-             <button onClick={stopVisualization} className="absolute bottom-8 pointer-events-auto border border-gray-700 bg-black/50 text-gray-500 hover:text-white px-6 py-2 text-xs tracking-widest">
+             <button onClick={stopVisualization} className="absolute bottom-8 pointer-events-auto border border-gray-700 bg-black/50 text-gray-500 hover:text-white px-6 py-2 text-xs tracking-widest backdrop-blur">
                  TERMINATE
              </button>
          )}
