@@ -1,0 +1,5 @@
+{
+  "name": "Miku Vajfuša Protocol",
+  "description": "A reactive HTML5 audio visualizer simulating system decay beat-syncing with glitch aesthetics.",
+  "requestFramePermissions": []
+}
