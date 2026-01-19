@@ -5,6 +5,7 @@ const THEME = {
   primary: '#39c5bb',   // Miku Teal
   secondary: '#ff00ff', // Glitch Pink
   background: '#050505',
+  wave: '#00ffcc',      // Oscilloscope Cyan
 };
 
 // --- Shader Source (The "Brzi Arzi" / Cyberpunk Core) ---
@@ -36,16 +37,13 @@ const FRAGMENT_SHADER = `
     float radius = length(uv);
     float angle = atan(uv.y, uv.x);
     
-    float vortex_anim = uTime * 0.5 + uBass * 2.0;
-    float tunnel = sin(10.0 * radius - iTime * 3.0 + uBass * 4.0) * 0.3;
-    
     // Twist based on bass
-    float spiral = angle + 1.0 / (radius + 0.1) * sin(uTime) + uBass;
+    float tunnel = sin(10.0 * radius - uTime * 3.0 + uBass * 4.0) * 0.3;
     
     vec3 col = mix(color_bg, color_teal, smoothstep(0.2, 1.2, radius + tunnel));
 
-    // 2. Matrix / Digital Rain (Vertical Noise)
-    if(uv.x < 0.8 && uv.x > -0.8) {
+    // 2. Matrix / Digital Rain (Vertical Noise - Shader based)
+    if(uv.x < 0.9 && uv.x > -0.9) {
         float rain_speed = uTime * 2.0 + uMid * 5.0;
         float rain = fract(uv.y * 10.0 + rain_speed + sin(uv.x * 20.0));
         float rain_glow = smoothstep(0.9, 1.0, rain) * (0.3 + uHigh);
@@ -65,7 +63,7 @@ const FRAGMENT_SHADER = `
 
     gl_FragColor = vec4(col, 1.0);
   }
-`.replace(/iTime/g, 'uTime'); // Ensure naming consistency if snippet used iTime
+`;
 
 // --- Types ---
 interface Particle {
@@ -205,7 +203,6 @@ const Visualizer: React.FC = () => {
   useEffect(() => {
     window.addEventListener('resize', handleResize);
     handleResize();
-    // Initialize WebGL context early
     initWebGL();
     return () => window.removeEventListener('resize', handleResize);
   }, [handleResize, initWebGL]);
@@ -235,7 +232,6 @@ const Visualizer: React.FC = () => {
 
     // Frequency Bands
     let bass = 0, mid = 0, high = 0;
-    // Lower freq range for bass
     for(let i=0; i<10; i++) bass += dataArray[i];
     for(let i=10; i<100; i++) mid += dataArray[i];
     for(let i=100; i<bufferLength; i++) high += dataArray[i];
@@ -244,7 +240,7 @@ const Visualizer: React.FC = () => {
     mid = mid / 90 / 255;
     high = high / (bufferLength - 100) / 255;
 
-    const isBassHit = bass > 0.7; // Hard hit threshold
+    const isBassHit = bass > 0.7; 
 
     // 2. Render WebGL Background
     const locs = uniformLocsRef.current;
@@ -256,19 +252,51 @@ const Visualizer: React.FC = () => {
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
     // 3. Composite WebGL -> 2D Canvas
-    // We draw the WebGL output as the background image
     ctx.drawImage(glCanvas, 0, 0);
 
-    // 4. Update & Draw Particles (Debris)
+    // 4. Oscilloscope Waveform (The "Neural Link" Effect)
+    // Get time domain data
+    const timeDomain = new Uint8Array(bufferLength);
+    analyser.getByteTimeDomainData(timeDomain);
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = THEME.wave;
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = THEME.wave;
+    ctx.beginPath();
+
+    const sliceW = w * 1.0 / bufferLength;
+    let x = 0;
+
+    for(let i = 0; i < bufferLength; i++) {
+        const v = timeDomain[i] / 128.0;
+        const y = v * (h / 2);
+
+        // Glitch Shake
+        let gx = x;
+        let gy = y;
+        if(bass > 0.8) {
+            gx += (Math.random() * 20 - 10);
+            gy += (Math.random() * 50 - 25);
+        }
+
+        if(i === 0) ctx.moveTo(gx, gy);
+        else ctx.lineTo(gx, gy);
+
+        x += sliceW;
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0; // Reset
+
+    // 5. Update & Draw Particles (Debris)
     if (isBassHit) {
-        // Spawn particles
         const count = Math.floor(bass * 5);
         for(let k=0; k<count; k++) {
             particlesRef.current.push({
                 x: Math.random() * w,
                 y: Math.random() * h,
                 w: Math.random() * 5 + 2,
-                h: Math.random() * 20 + 2, // Elongated debris
+                h: Math.random() * 20 + 2,
                 vx: (Math.random() - 0.5) * 20,
                 vy: (Math.random() - 0.5) * 20,
                 life: 1.0,
@@ -277,7 +305,6 @@ const Visualizer: React.FC = () => {
         }
     }
 
-    // Process particles
     for (let i = particlesRef.current.length - 1; i >= 0; i--) {
         const p = particlesRef.current[i];
         p.x += p.vx;
@@ -294,13 +321,13 @@ const Visualizer: React.FC = () => {
         }
     }
 
-    // 5. Draw Spectrum with "Web" Effect
+    // 6. Draw Spectrum with "Web" Effect
     const radius = Math.min(w, h) * 0.2 + (bass * 50);
     ctx.lineWidth = 2;
     ctx.strokeStyle = THEME.primary;
     ctx.beginPath();
     
-    const sliceCount = 120; // Reduced for style
+    const sliceCount = 120;
     const step = (Math.PI * 2) / sliceCount;
 
     for(let i=0; i<sliceCount; i++) {
@@ -318,29 +345,26 @@ const Visualizer: React.FC = () => {
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
 
-        // "Web" Connection Effect: Connect loud bars to center
         if (bass > 0.8 && val > 0.6 && i % 8 === 0) {
             ctx.moveTo(x2, y2);
-            ctx.lineTo(cx, cy); // Lightning bolt to center
+            ctx.lineTo(cx, cy);
         }
     }
     ctx.stroke();
 
-    // 6. Glitch Text (MIKU VAJFUŠA)
+    // 7. Glitch Text
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     let fontSize = Math.min(w, h) * 0.08;
     
     if (isBassHit) {
-        // Skew & shake transform
         const skew = (Math.random() - 0.5);
         const shakeX = (Math.random() - 0.5) * 20;
         const shakeY = (Math.random() - 0.5) * 20;
         ctx.translate(cx + shakeX, cy + shakeY);
         ctx.transform(1, skew, 0, 1, 0, 0);
         
-        // Chromatic Aberration Text
         ctx.font = `900 ${fontSize}px monospace`;
         ctx.fillStyle = '#ff0000';
         ctx.fillText("MIKU", -5, -40);
@@ -361,7 +385,7 @@ const Visualizer: React.FC = () => {
     }
     ctx.restore();
 
-    // 7. Scanlines Overlay
+    // 8. Scanlines
     ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
     for (let y = 0; y < h; y += 4) {
         ctx.fillRect(0, y, w, 1);
@@ -374,7 +398,7 @@ const Visualizer: React.FC = () => {
   const initializeAudio = async (mode: 'PLAY' | 'EXPORT') => {
     if (!file) return;
     stopVisualization();
-    initWebGL(); // Ensure GL is ready
+    initWebGL();
 
     const CtxClass = window.AudioContext || (window as any).webkitAudioContext;
     const actx = new CtxClass();
@@ -400,7 +424,6 @@ const Visualizer: React.FC = () => {
             source.connect(dest);
 
             if (canvasRef.current) {
-                // Capture the 2D canvas (which has the WebGL composition)
                 const stream = canvasRef.current.captureStream(60);
                 const track = dest.stream.getAudioTracks()[0];
                 stream.addTrack(track);
@@ -477,7 +500,7 @@ const Visualizer: React.FC = () => {
                 <h1 className="text-5xl font-bold mb-2 tracking-tighter text-white" style={{textShadow: '3px 3px #ff00ff'}}>
                     MIKU PROTOCOL
                 </h1>
-                <p className="text-[#39c5bb] tracking-[0.5em] text-sm mb-8">V.9.0 HYBRID CORE</p>
+                <p className="text-[#39c5bb] tracking-[0.5em] text-sm mb-8">V.9.5 HYBRID CORE</p>
                 
                 <input type="file" ref={fileInputRef} onChange={handleFile} accept="audio/*" className="hidden" />
                 
