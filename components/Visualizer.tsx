@@ -6,6 +6,7 @@ const THEME = {
   secondary: '#ff00ff', // Glitch Pink
   background: '#050505',
   wave: '#00ffcc',      // Oscilloscope Cyan
+  matrix: '#00ff41',    // Matrix Green
 };
 
 // --- Shader Source (The "Brzi Arzi" / Cyberpunk Core) ---
@@ -42,19 +43,11 @@ const FRAGMENT_SHADER = `
     
     vec3 col = mix(color_bg, color_teal, smoothstep(0.2, 1.2, radius + tunnel));
 
-    // 2. Matrix / Digital Rain (Vertical Noise - Shader based)
-    if(uv.x < 0.9 && uv.x > -0.9) {
-        float rain_speed = uTime * 2.0 + uMid * 5.0;
-        float rain = fract(uv.y * 10.0 + rain_speed + sin(uv.x * 20.0));
-        float rain_glow = smoothstep(0.9, 1.0, rain) * (0.3 + uHigh);
-        col += color_green * rain_glow * 0.5;
-    }
-
-    // 3. Shockwaves (Rings)
+    // 2. Shockwaves (Rings)
     float shock = exp(-10.0 * abs(radius - 0.5 - uBass * 0.5));
     col += color_pink * shock * uBass;
 
-    // 4. Glitch Blocks
+    // 3. Glitch Blocks
     float block = step(0.9, fract(uv.x * 10.0 + uTime)) * step(0.9, fract(uv.y * 10.0 - uTime));
     col += vec3(1.0) * block * uHigh * 0.5;
 
@@ -81,6 +74,7 @@ const Visualizer: React.FC = () => {
   // --- Refs ---
   const canvasRef = useRef<HTMLCanvasElement>(null);      // 2D Composition Layer
   const glCanvasRef = useRef<HTMLCanvasElement>(null);    // WebGL Background Layer
+  const matrixCanvasRef = useRef<HTMLCanvasElement | null>(null); // Offscreen Matrix Layer
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   
@@ -95,8 +89,9 @@ const Visualizer: React.FC = () => {
   const programRef = useRef<WebGLProgram | null>(null);
   const uniformLocsRef = useRef<any>({});
 
-  // Particles
+  // Visual State Refs
   const particlesRef = useRef<Particle[]>([]);
+  const matrixDropsRef = useRef<number[]>([]); // Matrix Rain positions
 
   // Recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -197,6 +192,19 @@ const Visualizer: React.FC = () => {
       glCanvasRef.current.height = h;
 
       if (glRef.current) glRef.current.viewport(0, 0, w, h);
+
+      // Setup Matrix Canvas
+      if (!matrixCanvasRef.current) {
+        matrixCanvasRef.current = document.createElement('canvas');
+      }
+      matrixCanvasRef.current.width = w;
+      matrixCanvasRef.current.height = h;
+
+      // Reset Matrix Drops
+      const fontSize = 16;
+      const columns = Math.ceil(w / fontSize);
+      // Initialize drops at random Y positions
+      matrixDropsRef.current = new Array(columns).fill(0).map(() => Math.random() * -100);
     }
   }, []);
 
@@ -254,8 +262,50 @@ const Visualizer: React.FC = () => {
     // 3. Composite WebGL -> 2D Canvas
     ctx.drawImage(glCanvas, 0, 0);
 
-    // 4. Oscilloscope Waveform (The "Neural Link" Effect)
-    // Get time domain data
+    // 4. MATRIX RAIN EFFECT (Foreground, Persistent Trails)
+    const matrixCanvas = matrixCanvasRef.current;
+    if (matrixCanvas) {
+        const mCtx = matrixCanvas.getContext('2d');
+        if (mCtx) {
+            // Fade existing trails by reducing alpha (destination-out)
+            // This allows the WebGL background to show through the trails
+            mCtx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+            mCtx.globalCompositeOperation = 'destination-out';
+            mCtx.fillRect(0, 0, w, h);
+            mCtx.globalCompositeOperation = 'source-over';
+
+            const fontSize = 16;
+            mCtx.font = `${fontSize}px monospace`;
+            
+            const drops = matrixDropsRef.current;
+            for (let i = 0; i < drops.length; i++) {
+                const char = String.fromCharCode(0x30A0 + Math.random() * 96);
+                
+                // Bright flash on bass, else standard matrix green
+                if (isBassHit) {
+                    mCtx.fillStyle = Math.random() > 0.5 ? '#ffffff' : THEME.wave;
+                } else {
+                    mCtx.fillStyle = THEME.matrix;
+                }
+
+                const x = i * fontSize;
+                const y = drops[i] * fontSize;
+                mCtx.fillText(char, x, y);
+
+                // Reset drop
+                if (y > h && Math.random() > 0.975) {
+                    drops[i] = 0;
+                }
+                // Speed increment
+                drops[i] += (isBassHit ? 1.0 : 0.5) + (Math.random() * 0.2);
+            }
+            
+            // Draw the matrix layer on top of the WebGL background
+            ctx.drawImage(matrixCanvas, 0, 0);
+        }
+    }
+
+    // 5. Oscilloscope Waveform (Neural Link)
     const timeDomain = new Uint8Array(bufferLength);
     analyser.getByteTimeDomainData(timeDomain);
 
@@ -266,14 +316,14 @@ const Visualizer: React.FC = () => {
     ctx.beginPath();
 
     const sliceW = w * 1.0 / bufferLength;
-    let x = 0;
+    let wx = 0;
 
     for(let i = 0; i < bufferLength; i++) {
         const v = timeDomain[i] / 128.0;
         const y = v * (h / 2);
 
         // Glitch Shake
-        let gx = x;
+        let gx = wx;
         let gy = y;
         if(bass > 0.8) {
             gx += (Math.random() * 20 - 10);
@@ -283,12 +333,12 @@ const Visualizer: React.FC = () => {
         if(i === 0) ctx.moveTo(gx, gy);
         else ctx.lineTo(gx, gy);
 
-        x += sliceW;
+        wx += sliceW;
     }
     ctx.stroke();
     ctx.shadowBlur = 0; // Reset
 
-    // 5. Update & Draw Particles (Debris)
+    // 6. Update & Draw Particles (Debris)
     if (isBassHit) {
         const count = Math.floor(bass * 5);
         for(let k=0; k<count; k++) {
@@ -321,7 +371,7 @@ const Visualizer: React.FC = () => {
         }
     }
 
-    // 6. Draw Spectrum with "Web" Effect
+    // 7. Draw Spectrum with "Web" Effect
     const radius = Math.min(w, h) * 0.2 + (bass * 50);
     ctx.lineWidth = 2;
     ctx.strokeStyle = THEME.primary;
@@ -352,11 +402,11 @@ const Visualizer: React.FC = () => {
     }
     ctx.stroke();
 
-    // 7. Glitch Text
+    // 8. Glitch Text
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    let fontSize = Math.min(w, h) * 0.08;
+    let labelFontSize = Math.min(w, h) * 0.08;
     
     if (isBassHit) {
         const skew = (Math.random() - 0.5);
@@ -365,7 +415,7 @@ const Visualizer: React.FC = () => {
         ctx.translate(cx + shakeX, cy + shakeY);
         ctx.transform(1, skew, 0, 1, 0, 0);
         
-        ctx.font = `900 ${fontSize}px monospace`;
+        ctx.font = `900 ${labelFontSize}px monospace`;
         ctx.fillStyle = '#ff0000';
         ctx.fillText("MIKU", -5, -40);
         ctx.fillStyle = '#00ffff';
@@ -375,7 +425,7 @@ const Visualizer: React.FC = () => {
         ctx.fillText("VAJFUŠA", 0, 40);
     } else {
         ctx.translate(cx, cy);
-        ctx.font = `900 ${fontSize}px monospace`;
+        ctx.font = `900 ${labelFontSize}px monospace`;
         ctx.fillStyle = THEME.primary;
         ctx.shadowBlur = 10;
         ctx.shadowColor = THEME.primary;
@@ -385,7 +435,7 @@ const Visualizer: React.FC = () => {
     }
     ctx.restore();
 
-    // 8. Scanlines
+    // 9. Scanlines
     ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
     for (let y = 0; y < h; y += 4) {
         ctx.fillRect(0, y, w, 1);
@@ -492,7 +542,7 @@ const Visualizer: React.FC = () => {
       <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center z-10">
          <div className="absolute top-4 left-4 text-[#39c5bb] text-xs border-l-2 border-[#39c5bb] pl-2">
             <p>STATUS: {status}</p>
-            <p>ENGINE: HYBRID WEBGL+2D</p>
+            <p>ENGINE: HYBRID V10 (MATRIX+GL)</p>
          </div>
 
          {!isPlaying && (
@@ -500,7 +550,7 @@ const Visualizer: React.FC = () => {
                 <h1 className="text-5xl font-bold mb-2 tracking-tighter text-white" style={{textShadow: '3px 3px #ff00ff'}}>
                     MIKU PROTOCOL
                 </h1>
-                <p className="text-[#39c5bb] tracking-[0.5em] text-sm mb-8">V.9.5 HYBRID CORE</p>
+                <p className="text-[#39c5bb] tracking-[0.5em] text-sm mb-8">V.10.0 FINAL</p>
                 
                 <input type="file" ref={fileInputRef} onChange={handleFile} accept="audio/*" className="hidden" />
                 
