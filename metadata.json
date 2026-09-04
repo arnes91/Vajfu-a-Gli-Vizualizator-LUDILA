@@ -1,5 +1,10 @@
 {
-  "name": "Miku Vajfuša Protocol",
-  "description": "A reactive HTML5 audio visualizer simulating system decay beat-syncing with glitch aesthetics.",
-  "requestFramePermissions": []
+  "name": "Sovereign Vibe Sandbox // BRZI_STUDIO VJ Agent",
+  "description": "Real-time audio-reactive organic contour visualizer, 142 BPM Cyber-Balkan Hardwave synth engine, Gemini voice reactivity, and Autonomous Self-Evolution Engine.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
