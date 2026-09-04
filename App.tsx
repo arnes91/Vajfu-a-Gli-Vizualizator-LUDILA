@@ -176,7 +176,7 @@ const App: React.FC = () => {
         isOpen={isTelemetryDrawerOpen}
         onClose={() => setIsTelemetryDrawerOpen(false)}
         evolutionReport={evolutionReport}
-        adaptations={evolutionReport.appliedAdaptations}
+        adaptations={evolutionEngineRef.current.getAppliedAdaptations()}
         onRunEvolutionCycle={handleRunEvolutionCycle}
         isEvolving={isEvolving}
       />
