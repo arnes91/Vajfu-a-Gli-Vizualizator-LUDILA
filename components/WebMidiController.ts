@@ -232,4 +232,12 @@ export class WebMidiController {
       lastEvent: this.lastEvent,
     };
   }
+
+  public dispose() {
+    this.onControlChange = undefined;
+    this.onNoteTrigger = undefined;
+    this.onStatusChange = undefined;
+    this.onEventLog = undefined;
+  }
 }
+

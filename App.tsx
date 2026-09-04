@@ -110,7 +110,7 @@ const App: React.FC = () => {
           onToggleDiagnostics={() => setIsDiagnosticsOpen((prev) => !prev)}
           isDiagnosticsOpen={isDiagnosticsOpen}
           midiConnected={midiConnected}
-          memoryNodesCount={evolutionReport.activeMemoryNodes.length}
+          memoryNodesCount={evolutionReport.memoryNodes}
           syncScore={evolutionReport.crossModuleSyncScore}
         />
 
