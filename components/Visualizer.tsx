@@ -23,6 +23,19 @@ import { BalkanHardwaveSynth } from './BalkanHardwaveSynth';
 import { AIDJVoiceEngine } from './AIDJVoiceEngine';
 import { EvolutionEngine } from './EvolutionEngine';
 import {
+  loadSavedTheme,
+  saveActiveTheme,
+  loadSavedSettings,
+  saveActiveSettings,
+  loadSavedToggles,
+  saveActiveToggles,
+  loadSavedShaderMode,
+  saveActiveShaderMode,
+} from './storage';
+import { WebMidiController } from './WebMidiController';
+import { DiagnosticStats } from './DeveloperDiagnostics';
+import { useEvolutionVoiceAnnounce } from './useEvolutionVoiceAnnounce';
+import {
   Mic,
   Upload,
   Play,
@@ -60,7 +73,7 @@ declare global {
   }
 }
 
-// --- GLSL High-Octane Shaders ---
+// --- GLSL High-Octane Shaders with Cross-Fading ---
 const VERTEX_SHADER = `
   attribute vec2 position;
   void main() { gl_Position = vec4(position, 0.0, 1.0); }
@@ -74,13 +87,79 @@ const FRAGMENT_SHADER = `
   uniform float uMid;
   uniform float uHigh;
   uniform float uHueShift;
-  uniform int uShaderMode; // 0: ORGANIC_CONTOUR, 1: CYBER_TUNNEL, 2: DIGITAL_SOUL, 3: GOD_PARTICLE
+  uniform int uShaderMode; // Current: 0: ORGANIC_CONTOUR, 1: CYBER_TUNNEL, 2: DIGITAL_SOUL, 3: GOD_PARTICLE
+  uniform int uPrevShaderMode; // Previous mode for cross-fading
+  uniform float uCrossfade; // 0.0 (prev) to 1.0 (current)
   uniform vec3 uColor1; // Primary / Core
   uniform vec3 uColor2; // Secondary / Mid
   uniform vec3 uColor3; // Accent / Outer
+  uniform vec3 uPrevColor1;
+  uniform vec3 uPrevColor2;
+  uniform vec3 uPrevColor3;
 
   float hash(vec2 p) {
     return fract(1e4 * sin(17.0 * p.x + p.y * 0.1) * (0.1 + abs(sin(p.y * 13.0 + p.x))));
+  }
+
+  vec3 computeShader(int mode, vec2 cUV, float r, float a, vec3 c1, vec3 c2, vec3 c3, float time, float bass, float mid, float high) {
+    vec3 col = vec3(0.0);
+    // 0: ORGANIC CONTOUR RIPPLE (Cover Art Replication)
+    if (mode == 0) {
+      float harmonic = sin(r * 18.0 - time * 2.5 + sin(a * 5.0 + time * 1.5) * (0.15 + bass * 0.45))
+                     + cos(r * 32.0 - time * 3.5) * (mid * 0.35);
+
+      float contour = abs(sin(r * 14.0 - time * 1.2 + harmonic * 0.5));
+      float contourEdge = smoothstep(0.05, 0.0, abs(contour - 0.5));
+
+      vec3 grad = mix(c1, c2, smoothstep(0.05, 0.42, r));
+      grad = mix(grad, c3, smoothstep(0.38, 0.85, r));
+
+      float pulsar = (0.09 + bass * 0.22 + mid * 0.12) / (r * r * 4.2 + 0.04);
+      col = grad * (0.35 + harmonic * 0.35 + contourEdge * 0.75);
+      col += c1 * pulsar * 0.65;
+
+      float shock = 0.022 / (abs(r - (0.38 + bass * 0.42)) + 0.04);
+      col += c2 * shock * (0.6 + bass * 0.8);
+
+      float fineRings = sin(r * 48.0 - time * 5.0);
+      col += c3 * smoothstep(0.85, 1.0, fineRings) * high * 0.6;
+    }
+    // 1: CYBER TUNNEL 3D
+    else if (mode == 1) {
+      vec2 p = vec2(a / 3.14159265, 1.0 / (r + 0.02) + time * (1.2 + bass * 2.2));
+      float grid = abs(sin(p.x * 12.0) * sin(p.y * 8.0));
+      grid = smoothstep(0.85, 0.98, grid);
+
+      col = mix(c1, c2, sin(p.y * 2.0) * 0.5 + 0.5) * grid * (1.0 / (r + 0.25));
+      col += c3 * (0.03 / (abs(sin(p.y * 4.0)) + 0.05)) * mid;
+      col += c1 * (0.04 / (r + 0.05)) * (0.8 + bass);
+    }
+    // 2: DIGITAL SOUL FBM
+    else if (mode == 2) {
+      vec2 p = cUV * 2.5;
+      float f = 0.0;
+      vec2 q = vec2(sin(time * 0.4 + p.x), cos(time * 0.4 + p.y));
+      f += 0.500 * (sin(p.x * 2.0 + q.x + time * 0.8) + cos(p.y * 2.0 + q.y + time * 0.8));
+      p *= 2.02;
+      f += 0.250 * (sin(p.x * 2.0 + time * 1.2) + cos(p.y * 2.0 - time * 1.2));
+      f += (bass * 0.4 + mid * 0.2) * sin(length(cUV) * 12.0 - time * 4.0);
+
+      col = mix(c3, c2, clamp(f * 0.5 + 0.5, 0.0, 1.0));
+      col = mix(col, c1, clamp(pow(f * 0.5 + 0.5, 3.0), 0.0, 1.0));
+      col *= (1.0 - length(cUV) * 0.45);
+    }
+    // 3: GOD PARTICLE
+    else {
+      float vortex = a + 4.0 / (r + 0.08) - time * (2.0 + bass * 3.0);
+      float rays = abs(sin(vortex * 4.0));
+      float coreGlow = 0.05 / (r * r * 3.0 + 0.02);
+
+      col = c1 * coreGlow * (1.0 + bass * 1.5);
+      col += c2 * smoothstep(0.7, 0.95, rays) * (0.5 / (r + 0.1)) * (0.5 + mid);
+      float starRing = smoothstep(0.05, 0.0, abs(r - (0.4 + sin(time * 3.0) * 0.1 + bass * 0.2)));
+      col += c3 * starRing * 2.0;
+    }
+    return col;
   }
 
   void main() {
@@ -95,71 +174,15 @@ const FRAGMENT_SHADER = `
 
     float r = length(cUV);
     float a = atan(cUV.y, cUV.x);
-    vec3 col = vec3(0.0);
 
-    // 0: ORGANIC CONTOUR RIPPLE (Cover Art Replication)
-    if (uShaderMode == 0) {
-      // Audio-reactive fluid harmonic displacement
-      float harmonic = sin(r * 18.0 - uTime * 2.5 + sin(a * 5.0 + uTime * 1.5) * (0.15 + uBass * 0.45))
-                     + cos(r * 32.0 - uTime * 3.5) * (uMid * 0.35);
-
-      // Stepped contour isoline rings
-      float contour = abs(sin(r * 14.0 - uTime * 1.2 + harmonic * 0.5));
-      float contourEdge = smoothstep(0.05, 0.0, abs(contour - 0.5));
-
-      // Neon gradient blending (Core gold/yellow -> fiery orange mid -> deep magenta/purple border)
-      vec3 grad = mix(uColor1, uColor2, smoothstep(0.05, 0.42, r));
-      grad = mix(grad, uColor3, smoothstep(0.38, 0.85, r));
-
-      // Center pulsar glow responding to vocal speech & bass transients
-      float pulsar = (0.09 + uBass * 0.22 + uMid * 0.12) / (r * r * 4.2 + 0.04);
-      col = grad * (0.35 + harmonic * 0.35 + contourEdge * 0.75);
-      col += uColor1 * pulsar * 0.65;
-
-      // Outer harmonic shockwave ring
-      float shock = 0.022 / (abs(r - (0.38 + uBass * 0.42)) + 0.04);
-      col += uColor2 * shock * (0.6 + uBass * 0.8);
-
-      // Fine concentric rings
-      float fineRings = sin(r * 48.0 - uTime * 5.0);
-      col += uColor3 * smoothstep(0.85, 1.0, fineRings) * uHigh * 0.6;
-    }
-    // 1: CYBER TUNNEL 3D
-    else if (uShaderMode == 1) {
-      vec2 p = vec2(a / 3.14159265, 1.0 / (r + 0.02) + uTime * (1.2 + uBass * 2.2));
-      float grid = abs(sin(p.x * 12.0) * sin(p.y * 8.0));
-      grid = smoothstep(0.85, 0.98, grid);
-
-      col = mix(uColor1, uColor2, sin(p.y * 2.0) * 0.5 + 0.5) * grid * (1.0 / (r + 0.25));
-      col += uColor3 * (0.03 / (abs(sin(p.y * 4.0)) + 0.05)) * uMid;
-
-      // Tunnel core glow
-      col += uColor1 * (0.04 / (r + 0.05)) * (0.8 + uBass);
-    }
-    // 2: DIGITAL SOUL FBM
-    else if (uShaderMode == 2) {
-      vec2 p = cUV * 2.5;
-      float f = 0.0;
-      vec2 q = vec2(sin(uTime * 0.4 + p.x), cos(uTime * 0.4 + p.y));
-      f += 0.500 * (sin(p.x * 2.0 + q.x + uTime * 0.8) + cos(p.y * 2.0 + q.y + uTime * 0.8));
-      p *= 2.02;
-      f += 0.250 * (sin(p.x * 2.0 + uTime * 1.2) + cos(p.y * 2.0 - uTime * 1.2));
-      f += (uBass * 0.4 + uMid * 0.2) * sin(length(cUV) * 12.0 - uTime * 4.0);
-
-      col = mix(uColor3, uColor2, clamp(f * 0.5 + 0.5, 0.0, 1.0));
-      col = mix(col, uColor1, clamp(pow(f * 0.5 + 0.5, 3.0), 0.0, 1.0));
-      col *= (1.0 - length(cUV) * 0.45);
-    }
-    // 3: GOD PARTICLE
-    else {
-      float vortex = a + 4.0 / (r + 0.08) - uTime * (2.0 + uBass * 3.0);
-      float rays = abs(sin(vortex * 4.0));
-      float coreGlow = 0.05 / (r * r * 3.0 + 0.02);
-
-      col = uColor1 * coreGlow * (1.0 + uBass * 1.5);
-      col += uColor2 * smoothstep(0.7, 0.95, rays) * (0.5 / (r + 0.1)) * (0.5 + uMid);
-      float starRing = smoothstep(0.05, 0.0, abs(r - (0.4 + sin(uTime * 3.0) * 0.1 + uBass * 0.2)));
-      col += uColor3 * starRing * 2.0;
+    // Cross-fade interpolation between previous and current shader modes & palettes
+    vec3 col;
+    if (uCrossfade >= 0.999) {
+      col = computeShader(uShaderMode, cUV, r, a, uColor1, uColor2, uColor3, uTime, uBass, uMid, uHigh);
+    } else {
+      vec3 colA = computeShader(uPrevShaderMode, cUV, r, a, uPrevColor1, uPrevColor2, uPrevColor3, uTime, uBass, uMid, uHigh);
+      vec3 colB = computeShader(uShaderMode, cUV, r, a, uColor1, uColor2, uColor3, uTime, uBass, uMid, uHigh);
+      col = mix(colA, colB, smoothstep(0.0, 1.0, uCrossfade));
     }
 
     // CRT Scanlines
@@ -183,7 +206,39 @@ const hexToRgb = (hex: string): [number, number, number] => {
   return [r, g, b];
 };
 
-const Visualizer: React.FC = () => {
+export interface VisualizerProps {
+  evolutionEngine?: EvolutionEngine;
+  evolutionReport?: EvolutionReport;
+  isEvolving?: boolean;
+  onRunEvolutionCycle?: () => void;
+  midiController?: WebMidiController;
+  midiConnected?: boolean;
+  midiDeviceName?: string;
+  onUpdateDiagnosticStats?: (stats: DiagnosticStats) => void;
+  onOpenKnowledgeGraph?: () => void;
+  onOpenTelemetryDrawer?: () => void;
+  isDiagnosticsOpen?: boolean;
+  onToggleDiagnostics?: () => void;
+  isAISpeaking?: boolean;
+  onAISpeakingChange?: (speaking: boolean) => void;
+}
+
+const Visualizer: React.FC<VisualizerProps> = ({
+  evolutionEngine: externalEvolutionEngine,
+  evolutionReport: externalEvolutionReport,
+  isEvolving: externalIsEvolving,
+  onRunEvolutionCycle: externalRunEvolutionCycle,
+  midiController: externalMidiController,
+  midiConnected: externalMidiConnected,
+  midiDeviceName: externalMidiDeviceName,
+  onUpdateDiagnosticStats,
+  onOpenKnowledgeGraph,
+  onOpenTelemetryDrawer,
+  isDiagnosticsOpen,
+  onToggleDiagnostics,
+  isAISpeaking: externalIsAISpeaking,
+  onAISpeakingChange,
+}) => {
   // --- Refs ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const glCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -239,22 +294,63 @@ const Visualizer: React.FC = () => {
   const [isSynthPlaying, setIsSynthPlaying] = useState<boolean>(false);
   const [synthBpm, setSynthBpm] = useState<number>(142);
 
-  // Shader Mode & Theme
-  const [shaderMode, setShaderMode] = useState<ShaderMode>('ORGANIC_CONTOUR');
-  const [themeStyle, setThemeStyle] = useState<ThemeStyle>('SARAJEVO_SUNSET');
+  // Shader Mode & Theme (Hydrated from persistent LocalStorage)
+  const [shaderMode, setShaderMode] = useState<ShaderMode>(() => loadSavedShaderMode());
+  const [themeStyle, setThemeStyle] = useState<ThemeStyle>(() => loadSavedTheme());
+
+  // GLSL Shader & Theme Cross-fading Refs
+  const prevShaderModeIndexRef = useRef<number>(
+    loadSavedShaderMode() === 'ORGANIC_CONTOUR'
+      ? 0
+      : loadSavedShaderMode() === 'CYBER_TUNNEL'
+      ? 1
+      : loadSavedShaderMode() === 'DIGITAL_SOUL'
+      ? 2
+      : 3
+  );
+  const crossfadeStartTimeRef = useRef<number>(0);
+  const prevColor1Ref = useRef<[number, number, number]>(
+    hexToRgb(THEMES[loadSavedTheme()]?.primary || THEMES.SARAJEVO_SUNSET.primary)
+  );
+  const prevColor2Ref = useRef<[number, number, number]>(
+    hexToRgb(THEMES[loadSavedTheme()]?.secondary || THEMES.SARAJEVO_SUNSET.secondary)
+  );
+  const prevColor3Ref = useRef<[number, number, number]>(
+    hexToRgb(THEMES[loadSavedTheme()]?.wave || THEMES.SARAJEVO_SUNSET.wave)
+  );
 
   // Flash Hype Text Overlay Queue
   const [hypeTexts, setHypeTexts] = useState<HypeText[]>([]);
 
   // AI DJ & Voice
-  const [isAISpeaking, setIsAISpeaking] = useState<boolean>(false);
+  const [internalAISpeaking, setInternalAISpeaking] = useState<boolean>(false);
+  const isAISpeaking = externalIsAISpeaking !== undefined ? externalIsAISpeaking : internalAISpeaking;
+  const setIsAISpeaking = (v: boolean) => {
+    setInternalAISpeaking(v);
+    onAISpeakingChange?.(v);
+  };
   const [isMicListening, setIsMicListening] = useState<boolean>(false);
 
   // Evolution Engine State
-  const [evolutionReport, setEvolutionReport] = useState<EvolutionReport>(() =>
+  const [internalEvolutionReport, setInternalEvolutionReport] = useState<EvolutionReport>(() =>
     evolutionEngineRef.current.getReport()
   );
-  const [isEvolving, setIsEvolving] = useState<boolean>(false);
+  const evolutionReport = externalEvolutionReport || internalEvolutionReport;
+  const setEvolutionReport = setInternalEvolutionReport;
+
+  const [internalIsEvolving, setInternalIsEvolving] = useState<boolean>(false);
+  const isEvolving = externalIsEvolving !== undefined ? externalIsEvolving : internalIsEvolving;
+  const setIsEvolving = setInternalIsEvolving;
+
+  // Internal Web MIDI fallback
+  const internalMidiRef = useRef<WebMidiController>(new WebMidiController());
+  const midiController = externalMidiController || internalMidiRef.current;
+  const [internalMidiConnected, setInternalMidiConnected] = useState<boolean>(false);
+  const [internalMidiDeviceName, setInternalMidiDeviceName] = useState<string>('Standby');
+
+  // Diagnostics Performance Profiling
+  const frameCountRef = useRef<number>(0);
+  const lastFpsUpdateRef = useRef<number>(performance.now());
 
   // Share Link State
   const [shareCopied, setShareCopied] = useState<boolean>(false);
@@ -264,26 +360,11 @@ const Visualizer: React.FC = () => {
   const [cutEnd, setCutEnd] = useState<number>(0);
   const [currentTime, setCurrentTime] = useState<number>(0);
 
-  // Visual Toggles
-  const [toggles, setToggles] = useState<VisualToggles>({
-    matrixRain: true,
-    scanlines: true,
-    screenShake: true,
-    oscilloscope: true,
-    frequencyBars: true,
-    anaglyphSplit: true,
-    cssGlitch: true,
-  });
+  // Visual Toggles (Hydrated from persistent LocalStorage)
+  const [toggles, setToggles] = useState<VisualToggles>(() => loadSavedToggles());
 
-  // Reactive Settings
-  const [settings, setSettings] = useState<ReactiveSettings>({
-    sensitivity: 1.25,
-    decaySpeed: 0.8,
-    shakeIntensity: 1.0,
-    glitchThreshold: 0.55,
-    syncOffset: 0.0,
-    driftMultiplier: 1.0,
-  });
+  // Reactive Settings (Hydrated from persistent LocalStorage)
+  const [settings, setSettings] = useState<ReactiveSettings>(() => loadSavedSettings());
 
   // Live Audio Stats for HUD VU Meter
   const [liveStats, setLiveStats] = useState({ bass: 0, mid: 0, high: 0, isBurst: false });
@@ -378,9 +459,14 @@ const Visualizer: React.FC = () => {
       uHigh: gl.getUniformLocation(program, 'uHigh'),
       uHueShift: gl.getUniformLocation(program, 'uHueShift'),
       uShaderMode: gl.getUniformLocation(program, 'uShaderMode'),
+      uPrevShaderMode: gl.getUniformLocation(program, 'uPrevShaderMode'),
+      uCrossfade: gl.getUniformLocation(program, 'uCrossfade'),
       uColor1: gl.getUniformLocation(program, 'uColor1'),
       uColor2: gl.getUniformLocation(program, 'uColor2'),
       uColor3: gl.getUniformLocation(program, 'uColor3'),
+      uPrevColor1: gl.getUniformLocation(program, 'uPrevColor1'),
+      uPrevColor2: gl.getUniformLocation(program, 'uPrevColor2'),
+      uPrevColor3: gl.getUniformLocation(program, 'uPrevColor3'),
     };
   }, []);
 
@@ -646,33 +732,124 @@ const Visualizer: React.FC = () => {
     recognition.start();
   };
 
+  // Voice announcement hook for evolution telemetry
+  const { announceEvolutionReport } = useEvolutionVoiceAnnounce({
+    voiceEngineRef,
+    onSpeechStart: () => {
+      setIsAISpeaking(true);
+      setStatus('VOICE_SYNCED_TELEMETRY_STREAMING');
+    },
+    onSpeechEnd: () => {
+      setIsAISpeaking(false);
+      setIsEvolving(false);
+      setStatus('EVOLUTION_CYCLE_SYNCED');
+    },
+  });
+
   // --- RUN AUTONOMOUS EVOLUTION CYCLE ---
   const runEvolutionCycle = async () => {
+    if (externalRunEvolutionCycle) {
+      externalRunEvolutionCycle();
+      return;
+    }
     setIsEvolving(true);
     setStatus('RUNNING_AUTONOMOUS_EVOLUTION_CYCLE...');
 
-    const { report, spokenSummary } = evolutionEngineRef.current.runEvolutionCycle();
+    const activeEngine = externalEvolutionEngine || evolutionEngineRef.current;
+    const { report, spokenSummary } = activeEngine.runEvolutionCycle();
     setEvolutionReport(report);
 
     triggerHypeText(`${report.version} // SYNC ${report.crossModuleSyncScore}%`, '#00ff66');
 
-    // Speak evolution telemetry aloud with voice-synced ripples
-    setIsAISpeaking(true);
     if (!isPlaying) {
       setIsPlaying(true);
       renderFrame();
     }
 
-    await voiceEngineRef.current.speakText(
-      spokenSummary,
-      () => setStatus('VOICE_SYNCED_TELEMETRY_STREAMING'),
-      () => {
-        setIsAISpeaking(false);
-        setIsEvolving(false);
-        setStatus('EVOLUTION_CYCLE_SYNCED');
+    await announceEvolutionReport(report, spokenSummary);
+  };
+
+  // --- HARDWARE WEB MIDI API INTEGRATION ---
+  useEffect(() => {
+    midiController.init(
+      // CC Callback (Faders & Knobs)
+      (cc, val, norm) => {
+        if (cc === 1) {
+          // Mod Wheel -> Sensitivity (0.2x to 3.0x)
+          const newSens = Number((0.2 + norm * 2.8).toFixed(2));
+          setSettings((prev) => {
+            const next = { ...prev, sensitivity: newSens };
+            saveActiveSettings(next);
+            return next;
+          });
+          triggerHypeText(`MIDI CC1 SENS: ${newSens}x`, '#ffe600');
+        } else if (cc === 2) {
+          // Slider 2 -> Decay Speed
+          const newDecay = Number((0.1 + norm * 0.85).toFixed(2));
+          setSettings((prev) => {
+            const next = { ...prev, decaySpeed: newDecay };
+            saveActiveSettings(next);
+            return next;
+          });
+        } else if (cc === 7) {
+          // Slider 3 / Volume -> Screen Shake
+          const newShake = Number((norm * 3.0).toFixed(2));
+          setSettings((prev) => {
+            const next = { ...prev, shakeIntensity: newShake };
+            saveActiveSettings(next);
+            return next;
+          });
+          triggerHypeText(`MIDI CC7 SHAKE: ${newShake}x`, '#ff0055');
+        } else if (cc === 74) {
+          // Knob / Filter Cutoff -> Glitch Threshold
+          const newThresh = Number((0.3 + norm * 0.6).toFixed(2));
+          setSettings((prev) => {
+            const next = { ...prev, glitchThreshold: newThresh };
+            saveActiveSettings(next);
+            return next;
+          });
+          triggerHypeText(`MIDI CC74 GLITCH: ${newThresh}`, '#00f0ff');
+        }
+      },
+      // Note On Callback (Pads & Keys)
+      (note, vel) => {
+        if (note === 36) {
+          // Pad 1 (C1): Sub-Bass test pulse
+          testSubPulse();
+          triggerHypeText('MIDI PAD 1: SUB-PULSE', '#ffe600');
+        } else if (note === 38) {
+          // Pad 2 (D1): Glitch burst
+          setIsBurstActive(true);
+          setTimeout(() => setIsBurstActive(false), 350);
+          triggerHypeText('MIDI PAD 2: GLITCH BURST', '#ff00ff');
+        } else if (note === 40) {
+          // Pad 3 (E1): AI DJ Shoutout
+          triggerDJDrop('MIDI TRIGGER: SARAJEVO HARDWAVE ENGAGED!');
+        } else if (note === 42) {
+          // Pad 4 (F#1): Cycle Theme with GLSL Cross-fade
+          handleCycleTheme();
+        } else if (note === 48) {
+          // Pad 5 (C2): Run Evolution Cycle Automation
+          runEvolutionCycle();
+        } else if (note === 50) {
+          // Pad 6 (D2): Toggle 142 BPM Balkan Synth
+          toggleSynth();
+        }
+      },
+      // Status Change Callback
+      (connected, devName) => {
+        setInternalMidiConnected(connected);
+        setInternalMidiDeviceName(devName);
+        if (connected) {
+          triggerHypeText(`MIDI: ${devName}`, '#00ff66');
+        }
       }
     );
-  };
+
+    return () => {
+      midiController.dispose();
+    };
+  }, [midiController, themeStyle, shaderMode]);
 
   // --- CAPTURE SCREENSHOT (PNG) ---
   const handleCaptureScreenshot = () => {
@@ -709,8 +886,37 @@ const Visualizer: React.FC = () => {
     setTimeout(() => setShareCopied(false), 2500);
   };
 
-  // --- CYCLE THEMES (AI PALETTE GEN) ---
-  const cycleTheme = () => {
+  // --- SHADER & THEME CROSS-FADING HANDLERS ---
+  const handleShaderModeChange = (newMode: ShaderMode) => {
+    if (newMode === shaderMode) return;
+    const currentModeIdx =
+      shaderMode === 'ORGANIC_CONTOUR'
+        ? 0
+        : shaderMode === 'CYBER_TUNNEL'
+        ? 1
+        : shaderMode === 'DIGITAL_SOUL'
+        ? 2
+        : 3;
+    prevShaderModeIndexRef.current = currentModeIdx;
+    crossfadeStartTimeRef.current = performance.now();
+    setShaderMode(newMode);
+    saveActiveShaderMode(newMode);
+    setStatus(`GLSL_SHADER_CROSSFADE: ${newMode}`);
+  };
+
+  const handleThemeChange = (newTheme: ThemeStyle) => {
+    if (newTheme === themeStyle) return;
+    const curr = THEMES[themeStyle] || THEMES.SARAJEVO_SUNSET;
+    prevColor1Ref.current = hexToRgb(curr.primary);
+    prevColor2Ref.current = hexToRgb(curr.secondary);
+    prevColor3Ref.current = hexToRgb(curr.wave);
+    crossfadeStartTimeRef.current = performance.now();
+    setThemeStyle(newTheme);
+    saveActiveTheme(newTheme);
+    setStatus(`THEME_CROSSFADE: ${newTheme}`);
+  };
+
+  const handleCycleTheme = () => {
     const list: ThemeStyle[] = [
       'SARAJEVO_SUNSET',
       'BALKAN_NEON_CYBER',
@@ -720,8 +926,20 @@ const Visualizer: React.FC = () => {
     ];
     const currentIndex = list.indexOf(themeStyle);
     const nextIndex = (currentIndex + 1) % list.length;
-    setThemeStyle(list[nextIndex]);
-    setStatus(`PALETTE_APPLIED: ${list[nextIndex]}`);
+    handleThemeChange(list[nextIndex]);
+  };
+
+  const handleToggleChange = (k: keyof VisualToggles) => {
+    setToggles((prev) => {
+      const next = { ...prev, [k]: !prev[k] };
+      saveActiveToggles(next);
+      return next;
+    });
+  };
+
+  const handleSettingsChange = (newSettings: ReactiveSettings) => {
+    setSettings(newSettings);
+    saveActiveSettings(newSettings);
   };
 
   // --- AI LYRICS SYNC ENGINE ---
@@ -980,27 +1198,77 @@ const Visualizer: React.FC = () => {
     if (bass > 0.6) hueShiftRef.current += 0.02;
     hueShiftRef.current += 0.001;
 
-    // 2. WebGL Background (Shader with Theme Colors & Selected Shader Mode)
+    // 2. WebGL Background (Shader with Cross-Fading & Dynamic Theme Palettes)
     const locs = uniformLocsRef.current;
-    gl.uniform1f(locs.uTime, time);
-    gl.uniform2f(locs.uResolution, w, h);
-    gl.uniform1f(locs.uBass, bass);
-    gl.uniform1f(locs.uMid, mid);
-    gl.uniform1f(locs.uHigh, high);
-    gl.uniform1f(locs.uHueShift, hueShiftRef.current % 1.0);
+    if (locs.uTime) gl.uniform1f(locs.uTime, time);
+    if (locs.uResolution) gl.uniform2f(locs.uResolution, w, h);
+    if (locs.uBass) gl.uniform1f(locs.uBass, bass);
+    if (locs.uMid) gl.uniform1f(locs.uMid, mid);
+    if (locs.uHigh) gl.uniform1f(locs.uHigh, high);
+    if (locs.uHueShift) gl.uniform1f(locs.uHueShift, hueShiftRef.current % 1.0);
 
-    const shaderModeIndex =
-      shaderMode === 'ORGANIC_CONTOUR' ? 0 : shaderMode === 'CYBER_TUNNEL' ? 1 : shaderMode === 'DIGITAL_SOUL' ? 2 : 3;
-    gl.uniform1i(locs.uShaderMode, shaderModeIndex);
+    const now = performance.now();
+    const crossfadeDuration = 800.0;
+    const crossfadeElapsed = (now - crossfadeStartTimeRef.current) / crossfadeDuration;
+    const crossfadeProgress = Math.min(1.0, Math.max(0.0, crossfadeElapsed));
+
+    const currentShaderIndex =
+      shaderMode === 'ORGANIC_CONTOUR'
+        ? 0
+        : shaderMode === 'CYBER_TUNNEL'
+        ? 1
+        : shaderMode === 'DIGITAL_SOUL'
+        ? 2
+        : 3;
+
+    if (locs.uShaderMode) gl.uniform1i(locs.uShaderMode, currentShaderIndex);
+    if (locs.uPrevShaderMode) gl.uniform1i(locs.uPrevShaderMode, prevShaderModeIndexRef.current);
+    if (locs.uCrossfade) gl.uniform1f(locs.uCrossfade, crossfadeProgress);
 
     const c1 = hexToRgb(currentTheme.primary);
     const c2 = hexToRgb(currentTheme.secondary);
     const c3 = hexToRgb(currentTheme.wave);
-    gl.uniform3f(locs.uColor1, c1[0], c1[1], c1[2]);
-    gl.uniform3f(locs.uColor2, c2[0], c2[1], c2[2]);
-    gl.uniform3f(locs.uColor3, c3[0], c3[1], c3[2]);
+    if (locs.uColor1) gl.uniform3f(locs.uColor1, c1[0], c1[1], c1[2]);
+    if (locs.uColor2) gl.uniform3f(locs.uColor2, c2[0], c2[1], c2[2]);
+    if (locs.uColor3) gl.uniform3f(locs.uColor3, c3[0], c3[1], c3[2]);
+
+    if (locs.uPrevColor1)
+      gl.uniform3f(locs.uPrevColor1, prevColor1Ref.current[0], prevColor1Ref.current[1], prevColor1Ref.current[2]);
+    if (locs.uPrevColor2)
+      gl.uniform3f(locs.uPrevColor2, prevColor2Ref.current[0], prevColor2Ref.current[1], prevColor2Ref.current[2]);
+    if (locs.uPrevColor3)
+      gl.uniform3f(locs.uPrevColor3, prevColor3Ref.current[0], prevColor3Ref.current[1], prevColor3Ref.current[2]);
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // FPS & Real-time performance diagnostics
+    frameCountRef.current++;
+    if (now - lastFpsUpdateRef.current >= 400) {
+      const fps = Math.round((frameCountRef.current * 1000) / (now - lastFpsUpdateRef.current));
+      frameCountRef.current = 0;
+      lastFpsUpdateRef.current = now;
+
+      const frameTimeMs = Number((1000 / Math.max(1, fps)).toFixed(2));
+      const audioSampleRate = ac.sampleRate || 48000;
+      const audioLatencyMs = (ac as any).baseLatency ? Number(((ac as any).baseLatency * 1000).toFixed(1)) : 8.5;
+      const memObj = (performance as any).memory;
+      const jsHeapUsedMB = memObj?.usedJSHeapSize ? Number((memObj.usedJSHeapSize / (1024 * 1024)).toFixed(1)) : undefined;
+      const jsHeapTotalMB = memObj?.totalJSHeapSize ? Number((memObj.totalJSHeapSize / (1024 * 1024)).toFixed(1)) : undefined;
+
+      const newStats: DiagnosticStats = {
+        fps,
+        frameTimeMs,
+        audioSampleRate,
+        audioState: ac.state,
+        audioLatencyMs,
+        jsHeapUsedMB,
+        jsHeapTotalMB,
+        activeParticles: particlesRef.current.length,
+        canvasResolution: `${w}x${h}`,
+        glslShaderMode: shaderMode,
+      };
+      onUpdateDiagnosticStats?.(newStats);
+    }
 
     // 3. MAIN 2D COMPOSITION
     ctx.save();
@@ -1598,12 +1866,12 @@ const Visualizer: React.FC = () => {
         file={file}
         onSelectFileClick={() => fileInputRef.current?.click()}
         shaderMode={shaderMode}
-        onShaderModeChange={setShaderMode}
+        onShaderModeChange={handleShaderModeChange}
         currentTheme={themeStyle}
-        onThemeChange={setThemeStyle}
-        onCycleTheme={cycleTheme}
+        onThemeChange={handleThemeChange}
+        onCycleTheme={handleCycleTheme}
         toggles={toggles}
-        onToggleChange={(k) => setToggles((p) => ({ ...p, [k]: !p[k] }))}
+        onToggleChange={handleToggleChange}
         onTriggerDJDrop={triggerDJDrop}
         isAISpeaking={isAISpeaking}
         onTriggerHypeText={triggerHypeText}
